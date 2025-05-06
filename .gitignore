@@ -2,3 +2,4 @@ test.o
 par.o
 test.exe
 par.exe
+callgrind.*

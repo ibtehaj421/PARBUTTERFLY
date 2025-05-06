@@ -1,4 +1,9 @@
 #!/bin/bash
+set -e
+
+
+mkdir -p ~/.ssh
+
 
 # Check if the SSH key already exists, if not, generate it
 if [ ! -f ~/.ssh/id_rsa ]; then

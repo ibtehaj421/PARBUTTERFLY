@@ -4,11 +4,10 @@ FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y \
     bash \
     build-essential \
-    gprof \
+    binutils \
     valgrind \
     linux-tools-common \
     linux-tools-generic \
-    linux-tools-$(uname -r) \
     mpich \
     libmetis-dev \
     gcc g++ \
@@ -29,6 +28,7 @@ RUN mkdir -p /var/run/sshd && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 
+#RUN apt-get update && apt-get install -y valgrind && valgrind --version
 # Set environment to prevent interactive prompts
 # ENV DEBIAN_FRONTEND=noninteractive
 
@@ -48,4 +48,5 @@ SHELL ["/bin/bash","-c"]
 EXPOSE 22
 
 # Start SSH and keep the container alive
-CMD /usr/sbin/sshd -D & /setup_ssh.sh && tail -f /dev/null
+CMD /bin/bash -c "/usr/sbin/sshd && /setup_ssh.sh && tail -f /dev/null"
+

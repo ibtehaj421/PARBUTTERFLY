@@ -10,14 +10,37 @@
 #include <cstdint>
 #include <random>
 #include <unistd.h>
+#include <chrono>
+#include <cstdlib>
+#include <climits>
+#include <unordered_map>
 using namespace std;
 
 //type definition
 using Vertex = int64_t;
 using Edge = pair<Vertex , Vertex>;
-
+using Wedge = std::tuple<pair<Vertex, Vertex>, Vertex>;
 #define BATCH_SIZE 10000
 
+
+// Hash function for std::pair<Vertex, Vertex>
+struct pair_hash {
+    std::size_t operator()(const pair<Vertex, Vertex>& p) const {
+        auto h1 = hash<Vertex>{}(p.first);
+        auto h2 = hash<Vertex>{}(p.second);
+        return h1 ^ (h2 << 1);
+    }
+};
+
+size_t estimate_memory_usage(const std::vector<Wedge>& W, const std::unordered_map<std::pair<Vertex, Vertex>, std::vector<Vertex>, pair_hash>& wedge_freq, int rank) {
+    size_t total = 0;
+    total += W.size() * sizeof(Wedge);
+    for (const auto& [_, centers] : wedge_freq) {
+        total += centers.size() * sizeof(Vertex) + sizeof(std::pair<Vertex, Vertex>);
+    }
+    std::cout << "Rank " << rank << ": Estimated memory usage: " << total / (1024.0 * 1024.0) << " MB\n" << std::flush;
+    return total;
+}
 //Graph in CSR format
 struct Graph {
     vector<Vertex> xadj; //Offsets
@@ -29,6 +52,7 @@ struct Graph {
     vector<Vertex> U_vertices; //vertices in U
     vector<Vertex> V_vertices; //vertices in V
 };
+
 
 //Load the bipartite graph
 Graph extract(const string& filename,int rank){
@@ -57,8 +81,8 @@ Graph extract(const string& filename,int rank){
         edges.reserve(BATCH_SIZE);
         Vertex u,v;
         while( file >> u >> v >> weight >> stmp) {
-            u--;
-            v--;
+            //u--;
+            //v--;
             if(u < 0 || v < 0) {
                 cerr<<"Error: Negative vertex ID ("<<u<<","<<v<<")"<<endl;
                 MPI_Abort(MPI_COMM_WORLD,1);
@@ -239,8 +263,8 @@ Graph extract(const string& filename,int rank){
         Vertex u, v;
         //double weight,stmp;
         while (file >> u >> v >> weight >> stmp) {
-            u--;
-            v--;
+           // u--;
+           // v--;
             edges.emplace_back(u, v);
             if (edges.size() >= BATCH_SIZE) {
                 // Broadcast batch
@@ -640,171 +664,319 @@ void output_analysis(const Graph& g, const GraphStats& stats, const Preprocessed
     }
 }
 
+
 ///moving towards the counting framework.
-vector<Vertex> ButterflyCount(const Graph& g, const PreprocessedGraph& pg, const vector<Bucket>& buckets,int rank, int size) {
-    vector<Vertex> ButterflyCounts(g.nvtxs,0); //per vertex butterfly count.
-    //get local vertices from the bucket
-    const vector<Vertex>& localVertices = buckets[rank].vertices;
-    //map vertices to the owning ranks.
-    vector<int> vertexToRank(g.nvtxs,-1);
-    for(int r = 0; r<size;r++){
-        for(Vertex v : buckets[r].vertices){
-            vertexToRank[v] = r;
-        }
-    }
-    //collect which adjacency list is required from other processes.
-    vector<vector<Vertex>> sendAjncy(size);
-    vector<vector<Vertex>> recvAjncy(size);
-    vector<MPI_Request> sendReqs;
 
-    //determine what is required
-    for(Vertex u : localVertices) {
-        for(int i = g.xadj[u]; i< g.xadj[u+1]; i++) {
-            Vertex v = g.adjncy[i]; // seach v in V.
-            //Get wedges u-v-w
-            for(int j= g.xadj[v]; j< g.xadj[v+1]; j++) {
-                Vertex w = g.adjncy[j]; //w in U
-                if( w == u ) continue;
-                //gather w's list if not local
-                if(vertexToRank[w] != rank && vertexToRank[w] >= 0) {
-                    sendAjncy[vertexToRank[w]].push_back(w);
-                }
-            }
-        }
-    }
+void get_wedges(const Graph& g, const PreprocessedGraph& pg, const vector<Bucket>& buckets, 
+    int rank, int size,std::unordered_map<std::pair<Vertex, Vertex>, std::vector<Vertex>, pair_hash>& wedge_freq) {
+    //Timer timer("get_wedges");
+    const std::vector<Vertex>& local_vertices = buckets[rank].vertices;
+    const size_t batch_size = 1000000; // Process 1M wedges per batch
 
-    //remove dups
+    // Map vertices to ranks
+    std::vector<int> vertex_to_rank(g.nvtxs, -1);
     for (int r = 0; r < size; ++r) {
-        sort(sendAjncy[r].begin(), sendAjncy[r].end());
-        sendAjncy[r].erase(unique(sendAjncy[r].begin(), sendAjncy[r].end()), sendAjncy[r].end());
-    }
-
-    //exchange the adjacency lists between the ranks or processes to gather the data that is required.
-    vector<MPI_Request> reqs;
-    vector<int> sendSizes(size),recvSizes(size);
-    for (int r = 0; r < size; ++r) {
-        sendSizes[r] = sendAjncy[r].size();
-        MPI_Isend(&sendSizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
-        MPI_Irecv(&recvSizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
-    }
-
-    MPI_Waitall(reqs.size(),reqs.data(), MPI_STATUSES_IGNORE);
-    reqs.clear();
-
-    //now exhange the vertex lists.
-    for (int r = 0; r < size; ++r) {
-        if (sendSizes[r] > 0) {
-            MPI_Isend(sendAjncy[r].data(), sendSizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
-        }
-        if (recvSizes[r] > 0) {
-            recvAjncy[r].resize(recvSizes[r]);
-            MPI_Irecv(recvAjncy[r].data(), recvSizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
+        for (Vertex v : buckets[r].vertices) {
+            vertex_to_rank[v] = r;
         }
     }
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-    reqs.clear();
 
-    // Send adjacency lists
-    vector<vector<Vertex>> send_lists(size);
-    for (int r = 0; r < size; ++r) {
-        if (recvAjncy[r].empty()) continue;
-        send_lists[r].push_back(recvAjncy[r].size()); // Number of vertices
-        for (Vertex v : recvAjncy[r]) {
-            Vertex degree = g.xadj[v + 1] - g.xadj[v];
-            send_lists[r].push_back(degree);
-            for (size_t i = g.xadj[v]; i < g.xadj[v + 1]; ++i) {
-                send_lists[r].push_back(g.adjncy[i]);
-            }
-        }
-        MPI_Isend(send_lists[r].data(), send_lists[r].size(), MPI_INT64_T, r, 2, MPI_COMM_WORLD, &reqs.emplace_back());
-    }
+    // Communication for remote adjacency lists
+    std::vector<std::vector<Vertex>> send_adjncy(size);
+    std::vector<std::vector<Vertex>> recv_adjncy(size);
+    std::vector<std::vector<Vertex>> remote_adjncy(g.nvtxs);
 
-    // Receive adjacency lists
-    vector<vector<Vertex>> remote_adjncy(g.nvtxs);
-    for (int r = 0; r < size; ++r) {
-        if (sendAjncy[r].empty()) continue;
-        vector<Vertex> recv_list;
-        int count;
-        MPI_Status status;
-        MPI_Probe(r, 2, MPI_COMM_WORLD, &status);
-        MPI_Get_count(&status, MPI_INT64_T, &count);
-        recv_list.resize(count);
-        MPI_Recv(recv_list.data(), count, MPI_INT64_T, r, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        size_t idx = 0;
-        Vertex num_vertices = recv_list[idx++];
-        for (Vertex i = 0; i < num_vertices; ++i) {
-            Vertex degree = recv_list[idx++];
-            Vertex v = sendAjncy[r][i];
-            remote_adjncy[v].reserve(degree);
-            for (Vertex j = 0; j < degree; ++j) {
-                remote_adjncy[v].push_back(recv_list[idx++]);
-            }
-        }
-    }
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-
-    cout<<"Rank: "<< rank << " has reached the parallel butterfly counting loops" << endl;
-    //actual butterfly counts begin here.
-    #pragma omp parallel
     {
-        vector<Vertex> threadCounts(g.nvtxs,0); //this is the per thread count for butterflies.
-        #pragma omp for schedule(static) //was dynamic at first but code wasnt runnin as expected.
-        for(int idx = 0; idx < localVertices.size(); idx++) {
-            Vertex u = localVertices[idx]; //extract the u value
-            Vertex degree_u = g.xadj[u + 1] - g.xadj[u];
-                if (degree_u > 1000) {
-                    #pragma omp critical
-                    cout << "Rank " << rank << ": Processing high-degree vertex " << u << " with degree " << degree_u << "\n" << flush;
+        //Timer comm_timer("get_wedges_communication");
+        std::vector<bool> needed(g.nvtxs, false);
+        for (Vertex u : local_vertices) {
+            for (size_t i = g.xadj[u]; i < g.xadj[u + 1]; ++i) {
+                Vertex v = g.adjncy[i];
+                if (v >= g.nvtxs) {
+                    std::cerr << "Rank " << rank << ": Invalid vertex v=" << v << "\n" << std::flush;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
-            for(int i= g.xadj[u]; i< g.xadj[u+1]; i++) {
-                Vertex v = g.adjncy[i]; //v in V
-                for(int j = g.xadj[v]; j < g.xadj[v+1]; j++) {
-                    Vertex w = g.adjncy[j]; //w in U
-                    if(w == u) continue;
-                    //check if the adjacency is local or remote.
-                    const vector<Vertex>& wAdjcny = (vertexToRank[w] == rank || vertexToRank[w] < 0) ?
-                                                    vector<Vertex>(g.adjncy.begin() + g.xadj[w], g.adjncy.begin() + g.xadj[w+1])
-                                                    : remote_adjncy[w];
-                    //find the common neighbours;
-                    for(Vertex t : wAdjcny) {
-                        if (t == w) continue;
-                        //check if the u-t path exist.
-                        bool u_t_exists = false;
-                        for(int k= g.xadj[u]; k < g.xadj[u+1]; k++) {
-                            if(g.adjncy[k] == t) {
-                                u_t_exists = true;
-                                break;
-                            }
-                        }
-                        if(u_t_exists){
-                            //cout<<"Rank: "<<rank<<" is updating local counts"<<endl;
-                            threadCounts[u]++;
-                            threadCounts[w]++;
-                            threadCounts[v]++;
-                            threadCounts[t]++;
-                            //update the counts for 4 attached vertices
-                        }
+                for (size_t j = g.xadj[v]; j < g.xadj[v + 1]; ++j) {
+                    Vertex u2 = g.adjncy[j];
+                    if (u2 == u) continue;
+                    if (u2 >= g.nvtxs) {
+                        std::cerr << "Rank " << rank << ": Invalid vertex u2=" << u2 << "\n" << std::flush;
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                    if (vertex_to_rank[u2] != rank && vertex_to_rank[u2] >= 0) {
+                        needed[u2] = true;
                     }
                 }
             }
         }
-        //aggregate the counts.
-        cout<<"Rank: "<<rank<<" is updating global counts"<<endl;
-        #pragma omp critical
-        for(Vertex v = 0; v < g.nvtxs; v++) {
-            ButterflyCounts[v] += threadCounts[v];
+
+        for (Vertex u2 = 0; u2 < g.nvtxs; ++u2) {
+            if (needed[u2] && vertex_to_rank[u2] >= 0) {
+                send_adjncy[vertex_to_rank[u2]].push_back(u2);
+            }
         }
-        // #pragma omp for reduction(+:butterfly_counts[:g.nvtxs])
-        // for (Vertex v = 0; v < g.nvtxs; ++v) {
-        //     butterfly_counts[v] += thread_counts[v];
-        // }
+
+        for (int r = 0; r < size; ++r) {
+            std::sort(send_adjncy[r].begin(), send_adjncy[r].end());
+            send_adjncy[r].erase(std::unique(send_adjncy[r].begin(), send_adjncy[r].end()), send_adjncy[r].end());
+            std::cout << "Rank " << rank << ": Sending " << send_adjncy[r].size() << " vertices to rank " << r << "\n" << std::flush;
+        }
+
+        std::vector<MPI_Request> reqs;
+        std::vector<int> send_sizes(size), recv_sizes(size);
+        for (int r = 0; r < size; ++r) {
+            send_sizes[r] = send_adjncy[r].size();
+            MPI_Isend(&send_sizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
+            MPI_Irecv(&recv_sizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
+        }
+        MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+        reqs.clear();
+
+        for (int r = 0; r < size; ++r) {
+            if (send_sizes[r] > 0) {
+                MPI_Isend(send_adjncy[r].data(), send_sizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
+            }
+            if (recv_sizes[r] > 0) {
+                recv_adjncy[r].resize(recv_sizes[r]);
+                MPI_Irecv(recv_adjncy[r].data(), recv_sizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
+            }
+        }
+        MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+        reqs.clear();
+
+        // Calculate total send size
+        size_t total_send_size = 0;
+        for (int r = 0; r < size; ++r) {
+            if (recv_adjncy[r].empty()) continue;
+            for (Vertex v : recv_adjncy[r]) {
+                Vertex degree = g.xadj[v + 1] - g.xadj[v];
+                total_send_size += 1 + degree + 1; // num_vertices + degree + neighbors
+            }
+        }
+        bool use_buffered_send = total_send_size <= INT_MAX;
+        if (!use_buffered_send) {
+            std::cout << "Rank " << rank << ": Total send size " << total_send_size 
+                      << " exceeds INT_MAX, using non-buffered send\n" << std::flush;
+        }
+
+        char* send_buffer = nullptr;
+        int buffer_size = 0;
+        if (use_buffered_send && total_send_size > 0) {
+            buffer_size = total_send_size * sizeof(Vertex) * 2;
+            MPI_Alloc_mem(buffer_size, MPI_INFO_NULL, &send_buffer);
+            MPI_Buffer_attach(send_buffer, buffer_size);
+        }
+
+        std::vector<std::vector<Vertex>> send_lists(size);
+        for (int r = 0; r < size; ++r) {
+            if (recv_adjncy[r].empty()) continue;
+            send_lists[r].push_back(recv_adjncy[r].size());
+            for (Vertex v : recv_adjncy[r]) {
+                if (v >= g.nvtxs) {
+                    std::cerr << "Rank " << rank << ": Invalid vertex v=" << v << "\n" << std::flush;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+                Vertex degree = g.xadj[v + 1] - g.xadj[v];
+                send_lists[r].push_back(degree);
+                for (size_t i = g.xadj[v]; i < g.xadj[v + 1]; ++i) {
+                    send_lists[r].push_back(g.adjncy[i]);
+                }
+            }
+            if (!send_lists[r].empty()) {
+                if (use_buffered_send) {
+                    MPI_Bsend(send_lists[r].data(), send_lists[r].size(), MPI_INT64_T, r, 2, MPI_COMM_WORLD);
+                } else {
+                    MPI_Isend(send_lists[r].data(), send_lists[r].size(), MPI_INT64_T, r, 2, MPI_COMM_WORLD, &reqs.emplace_back());
+                }
+            }
+        }
+
+        for (int r = 0; r < size; ++r) {
+            if (send_adjncy[r].empty()) continue;
+            MPI_Status status;
+            int count;
+            MPI_Probe(r, 2, MPI_COMM_WORLD, &status);
+            MPI_Get_count(&status, MPI_INT64_T, &count);
+            std::vector<Vertex> recv_list(count);
+            MPI_Recv(recv_list.data(), count, MPI_INT64_T, r, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            size_t idx = 0;
+            Vertex num_vertices = recv_list[idx++];
+            if (num_vertices != send_adjncy[r].size()) {
+                std::cerr << "Rank " << rank << ": Mismatch in recv_adjncy[" << r << "] size\n" << std::flush;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            size_t mem_size = 0;
+            for (Vertex i = 0; i < num_vertices; ++i) {
+                Vertex degree = recv_list[idx++];
+                Vertex v = send_adjncy[r][i];
+                if (v >= g.nvtxs) {
+                    std::cerr << "Rank " << rank << ": Invalid vertex v=" << v << "\n" << std::flush;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+                remote_adjncy[v].reserve(degree);
+                mem_size += degree * sizeof(Vertex);
+                for (Vertex j = 0; j < degree; ++j) {
+                    Vertex neighbor = recv_list[idx++];
+                    if (neighbor >= g.nvtxs) {
+                        std::cerr << "Rank " << rank << ": Invalid neighbor " << neighbor << "\n" << std::flush;
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                    remote_adjncy[v].push_back(neighbor);
+                }
+            }
+            std::cout << "Rank " << rank << ": Received " << num_vertices << " adjncy lists from rank " << r 
+                      << ", ~" << mem_size / (1024.0 * 1024.0) << " MB\n" << std::flush;
+        }
+
+        if (use_buffered_send && send_buffer) {
+            MPI_Buffer_detach(&send_buffer, &buffer_size);
+            MPI_Free_mem(send_buffer);
+        }
+        if (!reqs.empty()) {
+            MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+        }
     }
 
-    //aggregate the counts accross the processes.
-    vector<Vertex> globalCounts(g.nvtxs);
-    MPI_Reduce(ButterflyCounts.data(),globalCounts.data(),g.nvtxs,MPI_INT64_T,MPI_SUM,0,MPI_COMM_WORLD);
+    // Batch processing of wedges
+    size_t total_wedges = 0;
+    std::vector<size_t> prefix_sum(local_vertices.size() + 1, 0);
+    for (size_t idx = 0; idx < local_vertices.size(); ++idx) {
+        Vertex u = local_vertices[idx];
+        size_t wedge_count = 0;
+        for (size_t i = g.xadj[u]; i < g.xadj[u + 1]; ++i) {
+            Vertex v = g.adjncy[i];
+            Vertex degree_v = g.xadj[v + 1] - g.xadj[v];
+            wedge_count += degree_v - 1;
+        }
+        prefix_sum[idx + 1] = prefix_sum[idx] + wedge_count;
+        total_wedges += wedge_count;
+    }
+    std::cout << "Rank " << rank << ": Total wedges to process: " << total_wedges << "\n" << std::flush;
 
-    return rank == 0 ? globalCounts : ButterflyCounts;
+    wedge_freq.reserve(total_wedges / 2);
+    std::vector<Wedge> W_batch(batch_size);
+    size_t processed_wedges = 0;
+
+    #pragma omp parallel
+    {
+        std::vector<Wedge> thread_W(batch_size);
+        size_t thread_processed = 0;
+        #pragma omp for schedule(dynamic) nowait
+        for (size_t idx = 0; idx < local_vertices.size(); ++idx) {
+            Vertex u = local_vertices[idx];
+            Vertex degree_u = g.xadj[u + 1] - g.xadj[u];
+            if (degree_u > 1000) {
+                #pragma omp critical
+                std::cout << "Rank " << rank << ": Processing high-degree vertex " << u << " with degree " << degree_u << "\n" << std::flush;
+            }
+            size_t wedge_idx = 0;
+            for (size_t i = g.xadj[u]; i < g.xadj[u + 1]; ++i) {
+                Vertex v = g.adjncy[i];
+                auto u2_begin = (vertex_to_rank[v] == rank || vertex_to_rank[v] < 0) ?
+                    g.adjncy.begin() + g.xadj[v] : remote_adjncy[v].begin();
+                auto u2_end = (vertex_to_rank[v] == rank || vertex_to_rank[v] < 0) ?
+                    g.adjncy.begin() + g.xadj[v + 1] : remote_adjncy[v].end();
+                for (auto it = u2_begin; it != u2_end; ++it) {
+                    Vertex u2 = *it;
+                    if (u2 == u) continue;
+                    thread_W[wedge_idx++] = {{u, u2}, v};
+                    if (wedge_idx >= batch_size) {
+                        #pragma omp critical
+                        {
+                            for (size_t j = 0; j < wedge_idx; ++j) {
+                                wedge_freq[std::get<0>(thread_W[j])].push_back(std::get<1>(thread_W[j]));
+                            }
+                            processed_wedges += wedge_idx;
+                        }
+                        thread_processed += wedge_idx;
+                        wedge_idx = 0;
+                    }
+                }
+            }
+            if (wedge_idx > 0) {
+                #pragma omp critical
+                {
+                    for (size_t j = 0; j < wedge_idx; ++j) {
+                        wedge_freq[std::get<0>(thread_W[j])].push_back(std::get<1>(thread_W[j]));
+                    }
+                    processed_wedges += wedge_idx;
+                }
+                thread_processed += wedge_idx;
+            }
+            if (idx % (local_vertices.size() / 10 + 1) == 0) {
+                #pragma omp critical
+                std::cout << "Rank " << rank << ": Processed " << idx << " of " << local_vertices.size() 
+                          << " vertices, " << processed_wedges << " wedges\n" << std::flush;
+            }
+        }
+        #pragma omp critical
+        std::cout << "Rank " << rank << ": Thread processed " << thread_processed << " wedges\n" << std::flush;
+    }
+
+    // Clear remote_adjncy to free memory
+    remote_adjncy.clear();
+    remote_adjncy.shrink_to_fit();
+    std::cout << "Rank " << rank << ": Completed wedge processing, total wedges: " << processed_wedges << "\n" << std::flush;
+}
+vector<Vertex> ButterflyCount(const Graph& g, const PreprocessedGraph& pg, const vector<Bucket>& buckets,int rank, int size) {
+    std::unordered_map<std::pair<Vertex, Vertex>, std::vector<Vertex>, pair_hash> wedge_freq;
+    get_wedges(g, pg, buckets, rank, size, wedge_freq);
+    // GET-FREQ(W)
+        // Log memory usage
+        estimate_memory_usage({}, wedge_freq, rank);
+
+        // Prepare R and F
+        std::vector<std::pair<std::pair<Vertex, Vertex>, Vertex>> R; // ((u1, u2), d)
+        R.reserve(wedge_freq.size());
+        std::vector<size_t> F(wedge_freq.size() + 1, 0);
+        size_t idx = 0;
+        size_t total_centers = 0;
+        for (const auto& [endpoints, centers] : wedge_freq) {
+            R.emplace_back(endpoints, centers.size());
+            F[idx + 1] = F[idx] + centers.size();
+            total_centers += centers.size();
+            idx++;
+        }
+        std::cout << "Rank " << rank << ": Computed " << R.size() << " unique wedge endpoint pairs, total centers " << total_centers << "\n" << std::flush;
+    
+        // COUNT-V-WEDGES
+        std::vector<Vertex> butterfly_counts(g.nvtxs, 0);
+        #pragma omp parallel
+        {
+            std::vector<Vertex> thread_counts(g.nvtxs, 0);
+            // Count for endpoints
+            #pragma omp for schedule(dynamic) nowait
+            for (size_t i = 0; i < R.size(); ++i) {
+                auto [endpoints, d] = R[i];
+                Vertex u1 = endpoints.first;
+                Vertex u2 = endpoints.second;
+                Vertex count = (d * (d - 1)) / 2;
+                thread_counts[u1] += count;
+                thread_counts[u2] += count;
+            }
+            // Count for centers
+            #pragma omp for schedule(dynamic) nowait
+            for (size_t i = 0; i < R.size(); ++i) {
+                Vertex d = R[i].second;
+                for (size_t j = F[i]; j < F[i + 1]; ++j) {
+                    Vertex v = wedge_freq[R[i].first][j - F[i]];
+                    thread_counts[v] += d - 1;
+                }
+            }
+            // Manual reduction
+            #pragma omp critical
+            for (Vertex v = 0; v < g.nvtxs; ++v) {
+                butterfly_counts[v] += thread_counts[v];
+            }
+        }
+    
+        // Aggregate counts across processes
+        std::vector<Vertex> global_counts(g.nvtxs);
+        std::cout << "Rank " << rank << ": Starting MPI_Reduce\n" << std::flush;
+        MPI_Reduce(butterfly_counts.data(), global_counts.data(), g.nvtxs, MPI_INT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+        std::cout << "Rank " << rank << ": Completed MPI_Reduce\n" << std::flush;
+    
+        return rank == 0 ? global_counts : butterfly_counts;
 }
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
@@ -837,23 +1009,71 @@ int main(int argc, char* argv[]) {
         std::cout << "Using " << num_threads << " OpenMP threads per node\n";
     }
 
+    // Initialize timers
+    double start_time, end_time;
+    double extract_time = 0.0, analyze_time = 0.0, preprocess_time = 0.0;
+    double bucket_time = 0.0, butterfly_time = 0.0, output_time = 0.0;
+
     // Load graph
     string filename = "movies.edges";
+    start_time = MPI_Wtime();
     Graph g = extract(filename, rank);
+    end_time = MPI_Wtime();
+    extract_time = end_time - start_time;
 
     // Analyze graph
+    start_time = MPI_Wtime();
     GraphStats stats = analyzeGraph(g, rank);
+    end_time = MPI_Wtime();
+    analyze_time = end_time - start_time;
 
     // Preprocess graph
+    start_time = MPI_Wtime();
     PreprocessedGraph pg = Preprocessing(g, rank);
+    end_time = MPI_Wtime();
+    preprocess_time = end_time - start_time;
 
     // Partition graph into buckets
+    start_time = MPI_Wtime();
     vector<Bucket> buckets = bucket_partition(g, pg, size, rank);
+    end_time = MPI_Wtime();
+    bucket_time = end_time - start_time;
 
-    // Count the butterflies after wedge aggregation.
-    vector<Vertex> ButterflyCounts = ButterflyCount(g,pg,buckets,rank,size);
+    // Count the butterflies after wedge aggregation
+    start_time = MPI_Wtime();
+    vector<Vertex> ButterflyCounts = ButterflyCount(g, pg, buckets, rank, size);
+    end_time = MPI_Wtime();
+    butterfly_time = end_time - start_time;
+
     // Output analysis
-    output_analysis(g, stats, pg, buckets, rank,ButterflyCounts);
+    start_time = MPI_Wtime();
+    output_analysis(g, stats, pg, buckets, rank, ButterflyCounts);
+    end_time = MPI_Wtime();
+    output_time = end_time - start_time;
+
+    // Aggregate timings across processes (get maximum time for each method)
+    double max_extract_time, max_analyze_time, max_preprocess_time;
+    double max_bucket_time, max_butterfly_time, max_output_time;
+
+    MPI_Reduce(&extract_time, &max_extract_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&analyze_time, &max_analyze_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&preprocess_time, &max_preprocess_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&bucket_time, &max_bucket_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&butterfly_time, &max_butterfly_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&output_time, &max_output_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    // Print timings from rank 0
+    if (rank == 0) {
+        cout << "\nTiming Results (maximum across all processes):\n";
+        cout << "Extract Graph: " << max_extract_time << " seconds\n";
+        cout << "Analyze Graph: " << max_analyze_time << " seconds\n";
+        cout << "Preprocess Graph: " << max_preprocess_time << " seconds\n";
+        cout << "Bucket Partition: " << max_bucket_time << " seconds\n";
+        cout << "Butterfly Count: " << max_butterfly_time << " seconds\n";
+        cout << "Output Analysis: " << max_output_time << " seconds\n";
+        cout << "Total Time: " << (max_extract_time + max_analyze_time + max_preprocess_time +
+                               max_bucket_time + max_butterfly_time + max_output_time) << " seconds\n";
+    }
 
     MPI_Finalize();
     return 0;

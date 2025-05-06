@@ -508,32 +508,73 @@ PreprocessedGraph Preprocessing(const Graph& g, int rank) {
 //bucket partitioning instead of metis due to distribution issues with bipartite graphs.
 struct Bucket {
     vector<Vertex> vertices;
-    Vertex edgeCount;
+    Vertex wedgeCount;
 };
 
 vector<Bucket> bucket_partition(const Graph& g, const PreprocessedGraph& pg, int nparts, int rank) {
     vector<Bucket> buckets(nparts);
     if (rank == 0) {
         // Sort vertices by degree
-        vector<std::pair<Vertex, Vertex>> degree_order;
+        vector<std::pair<Vertex, Vertex>> wedge_order;
         for (Vertex v = 0; v < g.nvtxs; ++v) {
             Vertex degree = g.xadj[v + 1] - g.xadj[v];
-            degree_order.emplace_back(degree, v);
+            Vertex wedgeCount = degree * (degree - 1) / 2; //Number of wedges
+            wedge_order.emplace_back(wedgeCount, v);
         }
-        sort(degree_order.begin(), degree_order.end(), std::greater<>());
+        sort(wedge_order.begin(), wedge_order.end(), std::greater<>());
 
-        // Distribute vertices with edge cap
-        vector<Vertex> edgeCounts(nparts, 0);
-        Vertex max_edges_per_bucket = g.nedges / nparts + 1;
-        int current_bucket = 0;
-        for (const auto& [degree, v] : degree_order) {
-            if (current_bucket < nparts - 1 && edgeCounts[current_bucket] >= max_edges_per_bucket) {
-                current_bucket++;
-            }
-            buckets[current_bucket].vertices.push_back(v);
-            buckets[current_bucket].edgeCount += degree;
-            edgeCounts[current_bucket] += degree;
+        // Compute wedge counts
+        Vertex totalCount = 0;
+        for ( const auto& [wc,v] : wedge_order) {
+            totalCount += wc;
         }
+        Vertex maxWedgesPerBucket = totalCount / nparts + 1;
+        std::vector<Vertex> wedge_counts(nparts, 0);
+        for (int i = 0; i < nparts; ++i) {
+            buckets[i].wedgeCount = 0;
+        }
+
+        // Assign vertices to buckets with minimum current wedge count
+        for (const auto& [wc, v] : wedge_order) {
+            // Find bucket with minimum wedge count
+            int min_bucket = 0;
+            Vertex min_wedges = wedge_counts[0];
+            for (int i = 1; i < nparts; ++i) {
+                if (wedge_counts[i] < min_wedges) {
+                    min_wedges = wedge_counts[i];
+                    min_bucket = i;
+                }
+            }
+            buckets[min_bucket].vertices.push_back(v);
+            buckets[min_bucket].wedgeCount += wc;
+            wedge_counts[min_bucket] += wc;
+        }
+
+        // Debug: Print wedge counts
+        for (int i = 0; i < nparts; ++i) {
+            std::cout << "Rank 0: Initial Bucket " << i << ": " << buckets[i].vertices.size() 
+                      << " vertices, " << buckets[i].wedgeCount << " wedges\n" << std::flush;
+        }
+        // vector<Vertex> wedge_counts(nparts,0);
+        // int currentBucket = 0;
+        // for (const auto& [wc,v] : wedge_order) {
+        //     if(currentBucket < nparts - 1 && wedge_counts[currentBucket] >= maxWedgesPerBucket) {
+        //         currentBucket++;
+        //     }
+        //     buckets[currentBucket].vertices.push_back(v);
+        //     buckets[currentBucket].wedgeCount += wc;
+        //     wedge_counts[currentBucket] += wc;
+        // }
+        //Vertex max_edges_per_bucket = g.nedges / nparts + 1;
+        //int current_bucket = 0;
+        // for (const auto& [degree, v] : degree_order) {
+        //     if (current_bucket < nparts - 1 && edgeCounts[current_bucket] >= max_edges_per_bucket) {
+        //         current_bucket++;
+        //     }
+        //     buckets[current_bucket].vertices.push_back(v);
+        //     buckets[current_bucket].edgeCount += degree;
+        //     edgeCounts[current_bucket] += degree;
+        // }
     }
 
     // Broadcast bucket assignments
@@ -542,14 +583,14 @@ vector<Bucket> bucket_partition(const Graph& g, const PreprocessedGraph& pg, int
         MPI_Bcast(&size, 1, MPI_INT64_T, 0, MPI_COMM_WORLD);
         buckets[i].vertices.resize(size);
         MPI_Bcast(buckets[i].vertices.data(), size, MPI_INT64_T, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&buckets[i].edgeCount, 1, MPI_INT64_T, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&buckets[i].wedgeCount, 1, MPI_INT64_T, 0, MPI_COMM_WORLD);
     }
 
     return buckets;
 }
 
 // Output graph structure and analysis
-void output_analysis(const Graph& g, const GraphStats& stats, const PreprocessedGraph& pg, const std::vector<Bucket>& buckets, int rank) {
+void output_analysis(const Graph& g, const GraphStats& stats, const PreprocessedGraph& pg, const vector<Bucket>& buckets, int rank,vector<Vertex>& butterfly_counts) {
     if (rank == 0) {
         cout << "Graph Structure Analysis:\n";
         cout << "  Total Vertices: " << g.nvtxs << " (|U| = " << g.nU << ", |V| = " << g.nV << ")\n";
@@ -579,12 +620,192 @@ void output_analysis(const Graph& g, const GraphStats& stats, const Preprocessed
 
         // Bucket partitioning
         cout << "  Bucket Partitioning:\n";
+        Vertex total_wedges = 0;
         for (size_t i = 0; i < buckets.size(); ++i) {
-            cout << "    Bucket " << i << ": " << buckets[i].vertices.size() << " vertices, " << buckets[i].edgeCount / 2 << " edges\n";
+            total_wedges += buckets[i].wedgeCount;
         }
+        for (size_t i = 0; i < buckets.size(); ++i) {
+            double percentage = buckets[i].wedgeCount * 100.0 / total_wedges;
+            cout << "    Bucket " << i << ": " << buckets[i].vertices.size() 
+                      << " vertices, " << buckets[i].wedgeCount << " wedges (" 
+                      << percentage << "%)\n";
+        }
+
+        Vertex total_butterflies = 0;
+        for (Vertex count : butterfly_counts) {
+            total_butterflies += count;
+        }
+        total_butterflies /= 4; // Each butterfly counted 4 times
+        cout << "  Butterfly Count: " << total_butterflies << "\n";
     }
 }
 
+///moving towards the counting framework.
+vector<Vertex> ButterflyCount(const Graph& g, const PreprocessedGraph& pg, const vector<Bucket>& buckets,int rank, int size) {
+    vector<Vertex> ButterflyCounts(g.nvtxs,0); //per vertex butterfly count.
+    //get local vertices from the bucket
+    const vector<Vertex>& localVertices = buckets[rank].vertices;
+    //map vertices to the owning ranks.
+    vector<int> vertexToRank(g.nvtxs,-1);
+    for(int r = 0; r<size;r++){
+        for(Vertex v : buckets[r].vertices){
+            vertexToRank[v] = r;
+        }
+    }
+    //collect which adjacency list is required from other processes.
+    vector<vector<Vertex>> sendAjncy(size);
+    vector<vector<Vertex>> recvAjncy(size);
+    vector<MPI_Request> sendReqs;
+
+    //determine what is required
+    for(Vertex u : localVertices) {
+        for(int i = g.xadj[u]; i< g.xadj[u+1]; i++) {
+            Vertex v = g.adjncy[i]; // seach v in V.
+            //Get wedges u-v-w
+            for(int j= g.xadj[v]; j< g.xadj[v+1]; j++) {
+                Vertex w = g.adjncy[j]; //w in U
+                if( w == u ) continue;
+                //gather w's list if not local
+                if(vertexToRank[w] != rank && vertexToRank[w] >= 0) {
+                    sendAjncy[vertexToRank[w]].push_back(w);
+                }
+            }
+        }
+    }
+
+    //remove dups
+    for (int r = 0; r < size; ++r) {
+        sort(sendAjncy[r].begin(), sendAjncy[r].end());
+        sendAjncy[r].erase(unique(sendAjncy[r].begin(), sendAjncy[r].end()), sendAjncy[r].end());
+    }
+
+    //exchange the adjacency lists between the ranks or processes to gather the data that is required.
+    vector<MPI_Request> reqs;
+    vector<int> sendSizes(size),recvSizes(size);
+    for (int r = 0; r < size; ++r) {
+        sendSizes[r] = sendAjncy[r].size();
+        MPI_Isend(&sendSizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
+        MPI_Irecv(&recvSizes[r], 1, MPI_INT, r, 0, MPI_COMM_WORLD, &reqs.emplace_back());
+    }
+
+    MPI_Waitall(reqs.size(),reqs.data(), MPI_STATUSES_IGNORE);
+    reqs.clear();
+
+    //now exhange the vertex lists.
+    for (int r = 0; r < size; ++r) {
+        if (sendSizes[r] > 0) {
+            MPI_Isend(sendAjncy[r].data(), sendSizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
+        }
+        if (recvSizes[r] > 0) {
+            recvAjncy[r].resize(recvSizes[r]);
+            MPI_Irecv(recvAjncy[r].data(), recvSizes[r], MPI_INT64_T, r, 1, MPI_COMM_WORLD, &reqs.emplace_back());
+        }
+    }
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+    reqs.clear();
+
+    // Send adjacency lists
+    vector<vector<Vertex>> send_lists(size);
+    for (int r = 0; r < size; ++r) {
+        if (recvAjncy[r].empty()) continue;
+        send_lists[r].push_back(recvAjncy[r].size()); // Number of vertices
+        for (Vertex v : recvAjncy[r]) {
+            Vertex degree = g.xadj[v + 1] - g.xadj[v];
+            send_lists[r].push_back(degree);
+            for (size_t i = g.xadj[v]; i < g.xadj[v + 1]; ++i) {
+                send_lists[r].push_back(g.adjncy[i]);
+            }
+        }
+        MPI_Isend(send_lists[r].data(), send_lists[r].size(), MPI_INT64_T, r, 2, MPI_COMM_WORLD, &reqs.emplace_back());
+    }
+
+    // Receive adjacency lists
+    vector<vector<Vertex>> remote_adjncy(g.nvtxs);
+    for (int r = 0; r < size; ++r) {
+        if (sendAjncy[r].empty()) continue;
+        vector<Vertex> recv_list;
+        int count;
+        MPI_Status status;
+        MPI_Probe(r, 2, MPI_COMM_WORLD, &status);
+        MPI_Get_count(&status, MPI_INT64_T, &count);
+        recv_list.resize(count);
+        MPI_Recv(recv_list.data(), count, MPI_INT64_T, r, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        size_t idx = 0;
+        Vertex num_vertices = recv_list[idx++];
+        for (Vertex i = 0; i < num_vertices; ++i) {
+            Vertex degree = recv_list[idx++];
+            Vertex v = sendAjncy[r][i];
+            remote_adjncy[v].reserve(degree);
+            for (Vertex j = 0; j < degree; ++j) {
+                remote_adjncy[v].push_back(recv_list[idx++]);
+            }
+        }
+    }
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+
+    cout<<"Rank: "<< rank << " has reached the parallel butterfly counting loops" << endl;
+    //actual butterfly counts begin here.
+    #pragma omp parallel
+    {
+        vector<Vertex> threadCounts(g.nvtxs,0); //this is the per thread count for butterflies.
+        #pragma omp for schedule(static) //was dynamic at first but code wasnt runnin as expected.
+        for(int idx = 0; idx < localVertices.size(); idx++) {
+            Vertex u = localVertices[idx]; //extract the u value
+            Vertex degree_u = g.xadj[u + 1] - g.xadj[u];
+                if (degree_u > 1000) {
+                    #pragma omp critical
+                    cout << "Rank " << rank << ": Processing high-degree vertex " << u << " with degree " << degree_u << "\n" << flush;
+                }
+            for(int i= g.xadj[u]; i< g.xadj[u+1]; i++) {
+                Vertex v = g.adjncy[i]; //v in V
+                for(int j = g.xadj[v]; j < g.xadj[v+1]; j++) {
+                    Vertex w = g.adjncy[j]; //w in U
+                    if(w == u) continue;
+                    //check if the adjacency is local or remote.
+                    const vector<Vertex>& wAdjcny = (vertexToRank[w] == rank || vertexToRank[w] < 0) ?
+                                                    vector<Vertex>(g.adjncy.begin() + g.xadj[w], g.adjncy.begin() + g.xadj[w+1])
+                                                    : remote_adjncy[w];
+                    //find the common neighbours;
+                    for(Vertex t : wAdjcny) {
+                        if (t == w) continue;
+                        //check if the u-t path exist.
+                        bool u_t_exists = false;
+                        for(int k= g.xadj[u]; k < g.xadj[u+1]; k++) {
+                            if(g.adjncy[k] == t) {
+                                u_t_exists = true;
+                                break;
+                            }
+                        }
+                        if(u_t_exists){
+                            //cout<<"Rank: "<<rank<<" is updating local counts"<<endl;
+                            threadCounts[u]++;
+                            threadCounts[w]++;
+                            threadCounts[v]++;
+                            threadCounts[t]++;
+                            //update the counts for 4 attached vertices
+                        }
+                    }
+                }
+            }
+        }
+        //aggregate the counts.
+        cout<<"Rank: "<<rank<<" is updating global counts"<<endl;
+        #pragma omp critical
+        for(Vertex v = 0; v < g.nvtxs; v++) {
+            ButterflyCounts[v] += threadCounts[v];
+        }
+        // #pragma omp for reduction(+:butterfly_counts[:g.nvtxs])
+        // for (Vertex v = 0; v < g.nvtxs; ++v) {
+        //     butterfly_counts[v] += thread_counts[v];
+        // }
+    }
+
+    //aggregate the counts accross the processes.
+    vector<Vertex> globalCounts(g.nvtxs);
+    MPI_Reduce(ButterflyCounts.data(),globalCounts.data(),g.nvtxs,MPI_INT64_T,MPI_SUM,0,MPI_COMM_WORLD);
+
+    return rank == 0 ? globalCounts : ButterflyCounts;
+}
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     int rank, size;
@@ -629,8 +850,10 @@ int main(int argc, char* argv[]) {
     // Partition graph into buckets
     vector<Bucket> buckets = bucket_partition(g, pg, size, rank);
 
+    // Count the butterflies after wedge aggregation.
+    vector<Vertex> ButterflyCounts = ButterflyCount(g,pg,buckets,rank,size);
     // Output analysis
-    output_analysis(g, stats, pg, buckets, rank);
+    output_analysis(g, stats, pg, buckets, rank,ButterflyCounts);
 
     MPI_Finalize();
     return 0;

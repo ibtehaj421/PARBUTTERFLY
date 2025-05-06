@@ -2,7 +2,13 @@ FROM ubuntu:22.04
 
 # Install required tools
 RUN apt-get update && apt-get install -y \
+    bash \
     build-essential \
+    gprof \
+    valgrind \
+    linux-tools-common \
+    linux-tools-generic \
+    linux-tools-$(uname -r) \
     mpich \
     libmetis-dev \
     gcc g++ \
@@ -37,7 +43,7 @@ RUN chmod +x /setup_ssh.sh
 WORKDIR /workspace
 
 ENV OMP_NUM_THREADS=2
-
+SHELL ["/bin/bash","-c"]
 # Expose SSH port (for MPI communication)
 EXPOSE 22
 

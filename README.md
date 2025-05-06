@@ -47,6 +47,7 @@ cd /workspace
 
 ```bash
 mpicc -fopenmp -o test your_program.c
+mpicxx -fopenmp -O2 -std=c++17 -o par parbutter.cpp
 ```
 
 * `mpicc`: MPI C compiler wrapper.
@@ -72,6 +73,7 @@ ssh node3 "echo node3 is reachable"
 
 ```bash
 mpirun -np 3 --host node1,node2,node3 ./test
+mpirun --host node1:2,node2:2,node3:2 -np 3 ./par
 ```
 
 * `-np 3`: Total 3 MPI processes.

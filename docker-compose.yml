@@ -9,6 +9,15 @@ services:
     networks:
       mpi_net:
         ipv4_address: 172.20.0.2
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+        reservations:
+          cpus: 2
+    environment:
+      - OMP_NUM_THREADS=2
+      - OMP_PROC_BIND=true
     tty: true
     stdin_open: true
     volumes:
@@ -22,6 +31,15 @@ services:
     networks:
       mpi_net:
         ipv4_address: 172.20.0.3
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+        reservations:
+          cpus: 2
+    environment:
+      - OMP_NUM_THREADS=2
+      - OMP_PROC_BIND=true
     tty: true
     stdin_open: true
     volumes:
@@ -35,6 +53,15 @@ services:
     networks:
       mpi_net:
         ipv4_address: 172.20.0.4
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+        reservations:
+          cpus: 2
+    environment:
+      - OMP_NUM_THREADS=2
+      - OMP_PROC_BIND=true
     tty: true
     stdin_open: true
     volumes:

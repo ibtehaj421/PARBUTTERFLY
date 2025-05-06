@@ -29,11 +29,14 @@ RUN mkdir -p /var/run/sshd && \
 # Copy the SSH setup script
 COPY setup_ssh.sh /setup_ssh.sh
 
+
 # Make it executable
 RUN chmod +x /setup_ssh.sh
 
 # Set up workspace
 WORKDIR /workspace
+
+ENV OMP_NUM_THREADS=2
 
 # Expose SSH port (for MPI communication)
 EXPOSE 22
